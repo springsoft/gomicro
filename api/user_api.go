@@ -1,0 +1,82 @@
+package main
+
+import (
+	"flag"
+	"github.com/micro/go-micro"
+	"github.com/micro/go-micro/transport/grpc"
+	"github.com/micro/go-plugins/wrapper/breaker/hystrix"
+	"log"
+	user "micro-me/application/userserver/protos"
+
+	"github.com/gin-gonic/gin"
+	_ "github.com/go-sql-driver/mysql"
+	"github.com/go-xorm/xorm"
+	"github.com/micro/cli"
+	"github.com/micro/go-micro/config"
+	"github.com/micro/go-micro/registry"
+	"github.com/micro/go-micro/web"
+	"github.com/micro/go-plugins/registry/etcdv3"
+
+	userConfig "micro-me/application/userserver/cmd/config"
+	"micro-me/application/userserver/controller"
+	"micro-me/application/userserver/logic"
+	"micro-me/application/userserver/models"
+)
+
+func main() {
+	userRpcFlag := cli.StringFlag{
+		Name:  "f",
+		Value: "./application/userserver/cmd/config/config_api.json",
+		Usage: "please use xxx -f config_rpc.json",
+	}
+	configFile := flag.String(userRpcFlag.Name, userRpcFlag.Value, userRpcFlag.Usage)
+	flag.Parse()
+	conf := new(userConfig.ApiConfig)
+
+	if err := config.LoadFile(*configFile); err != nil {
+		log.Fatal(err)
+	}
+	if err := config.Scan(conf); err != nil {
+		log.Fatal(err)
+	}
+	engineUser, err := xorm.NewEngine(conf.Engine.Name, conf.Engine.DataSource)
+	if err != nil {
+		log.Fatal(err)
+	}
+	etcdRegisty := etcdv3.NewRegistry(
+		func(options *registry.Options) {
+			options.Addrs = conf.Etcd.Address
+		});
+
+	rpcService := micro.NewService(
+		micro.Name(conf.Server.Name),
+		micro.Registry(etcdRegisty),
+		micro.Transport(grpc.NewTransport()),
+		micro.WrapClient(hystrix.NewClientWrapper()),
+		micro.Flags(userRpcFlag),
+	)
+	rpcService.Init()
+	userRpcModel := user.NewUserService("user.rpc.server", rpcService.Client())
+
+	service := web.NewService(
+		web.Name(conf.Server.Name),
+		web.Registry(etcdRegisty),
+		web.Version(conf.Version),
+		web.Flags(userRpcFlag),
+		web.Address(conf.Port),
+	)
+
+	router := gin.Default()
+	userModel := models.NewMembersModel(engineUser)
+	userLogic := logic.NewUserLogic(userModel,userRpcModel)
+	userController := controller.NewUserController(userLogic)
+	userRouterGroup := router.Group("/user")
+	{
+		userRouterGroup.POST("/login", userController.Login)
+		userRouterGroup.POST("/register", userController.Register)
+	}
+	service.Handle("/", router)
+	if err := service.Run(); err != nil {
+		log.Fatal(err)
+	}
+}
